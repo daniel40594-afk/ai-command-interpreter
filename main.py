@@ -105,7 +105,20 @@ def main():
                 print(f"AI Error: {msg}")
                 continue
             
-            if action == 'find':
+            if action == 'list':
+                print(f"Listing files in: {source or 'Home Directory'}...")
+                # Note: list_files handles path resolution
+                result = actions.list_files(source)
+                if isinstance(result, list):
+                    print(f"Items found: {len(result)}")
+                    for item in result:
+                        print(f" {item}")
+                else:
+                    print(result)
+
+            elif action == 'find':
+                # 'find' is generally safe, but we can still ask or just run it.
+                # Let's just run it for convenience, or maybe concise output.
                 print("Retrieving file list...")
                 result = actions.find_files(file_type, source)
                 if isinstance(result, list):
