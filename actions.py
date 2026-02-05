@@ -5,6 +5,7 @@ import fnmatch
 from pathlib import Path
 
 # Blocklist of system directories to protect
+# (Even with home-containment, these provide an extra layer of safety if paths are malformed)
 SYSTEM_DIRS = [
     r"C:\Windows",
     r"C:\Program Files",
@@ -16,47 +17,70 @@ SYSTEM_DIRS = [
     r"C:\System Volume Information"
 ]
 
-def get_default_path():
-    """Returns the user's home directory."""
-    return os.path.expanduser("~")
+def get_home_dir():
+    """Returns the absolute path to the user's home directory."""
+    return Path.home().resolve()
 
 def resolve_path(path_str):
     """
     Resolves a path string to an absolute path.
-    Handles '~' expansion and relative paths.
+    - If None/Empty: Returns Home Directory.
+    - If Absolute: Returns it (will be checked by is_safe_path).
+    - If Relative: Resolves Relative to Home Directory.
     """
+    home = get_home_dir()
+    
     if not path_str:
-        return get_default_path()
+        return home
         
-    # Handle specific short names if needed, or just let shell expansion handle it?
-    # For now, standard expansion:
-    expanded = os.path.expanduser(path_str)
-    return os.path.abspath(expanded)
+    # If the user says "Downloads", we want Home/Downloads
+    # If the user says "actions.py" (current dir), we might need to be careful.
+    # The prompt says "natural language path mapping" -> 'this folder' is null.
+    # If null -> Home. 
+    # But if the user is in the project folder, they might expect '.' to be the project folder.
+    # However, strict instructions say "assume the tool is only allowed to operate inside the user's home directory".
+    # And "If no path is explicitly mentioned, use null."
+    # Let's adhere to: Relative paths are relative to HOME, unless they start with ./ which might imply CWD?
+    # Actually, for a file manager style usage, assuming Home as root is safest/most logical.
+    
+    path = Path(path_str)
+    if path.is_absolute():
+        return path.resolve()
+    else:
+        return (home / path).resolve()
 
 def is_safe_path(path_str):
     """
     Checks if a path is safe to operate on.
-    STRICTLY BLOCKS system directories.
+    STRICTLY ENFORCES: Path must be inside User Home Directory.
     """
     if not path_str:
-        return True # Default path is safe (User Home)
+        return True
     
     try:
-        path = Path(resolve_path(path_str)).resolve()
-        path_str_lower = str(path).lower()
+        if isinstance(path_str, Path):
+            path = path_str.resolve()
+        else:
+            path = resolve_path(path_str)
+            
+        home = get_home_dir()
         
+        # 1. Strict Containment Check
+        # is_relative_to returns True if path is inside home
+        if not path.is_relative_to(home):
+            print(f"DEBUG: Blocked path '{path}' - Not inside Home '{home}'")
+            return False
+            
+        # 2. explicit defined system blocklist (redundant but safe)
+        path_str_lower = str(path).lower()
         for sys_dir in SYSTEM_DIRS:
             sys_path = Path(os.path.expandvars(sys_dir)).resolve()
-            sys_path_str = str(sys_path).lower()
-            
-            # Check if path is inside a system directory
-            # We use string check to ensure we catch subdirectories
-            if path_str_lower.startswith(sys_path_str):
-                return False
-                
+            if path_str_lower.startswith(str(sys_path).lower()):
+                 return False
+
         return True
-    except Exception:
-        # If we can't resolve it, it's unsafe
+    except Exception as e:
+        print(f"DEBUG: Path check error: {e}")
         return False
 
 def list_files(path=None):
@@ -66,7 +90,7 @@ def list_files(path=None):
     target_path = resolve_path(path)
     
     if not is_safe_path(target_path):
-        return f"Error: Access to '{target_path}' is RESTRICTED (System Directory)."
+        return f"Error: Access to '{target_path}' is RESTRICTED (Outside User Home)."
         
     if not os.path.exists(target_path):
         return f"Error: Path '{target_path}' does not exist."
@@ -84,7 +108,7 @@ def list_files(path=None):
                 
         # Sort directories first, then files
         items.sort(key=lambda x: (x.startswith("[FILE]"), x.lower()))
-        return items[:100] # Limit to 100 items for display sanity
+        return items[:100]
     except PermissionError:
         return f"Error: Permission denied accessing '{target_path}'."
     except Exception as e:
@@ -93,12 +117,12 @@ def list_files(path=None):
 def find_files(file_type=None, source_path=None):
     """
     Finds files matching a type in a source path.
-    Defaults to User Home if no source provided.
     """
     start_dir = resolve_path(source_path)
     
-    if not is_safe_path(start_dir):
-        return f"Error: Access to '{start_dir}' is RESTRICTED."
+    if not is_safe_path(source_path): # Check original string too just in case
+         if not is_safe_path(start_dir):
+            return f"Error: Access to '{start_dir}' is RESTRICTED."
     
     results = []
     
@@ -107,15 +131,14 @@ def find_files(file_type=None, source_path=None):
 
     print(f"Searching in: {start_dir}")
     
-    # We limit recursion depth or count to avoid hanging on entire C: drive
     count = 0
     max_count = 50
     
     for root, dirnames, filenames in os.walk(start_dir):
-        # Safety check for every directory we enter
+        # Prevent recursing into unsafe directories (though they shouldn't be under Home)
+        # But 'AppData' might be large or sensitive.
         if not is_safe_path(root):
-            # distinct safe path check failed (e.g. symlink to system dir)
-            dirnames[:] = [] # Stop recursing here
+            dirnames[:] = []
             continue
             
         for filename in filenames:
@@ -143,7 +166,7 @@ def move_files(file_type, destination_path, source_path=None):
     dest_dir = resolve_path(destination_path)
     
     if not is_safe_path(src_dir) or not is_safe_path(dest_dir):
-        return "Error: unsafe path detected (System Directory)."
+        return "Error: unsafe path detected (Outside User Home)."
 
     if not os.path.exists(dest_dir):
         try:
@@ -154,13 +177,11 @@ def move_files(file_type, destination_path, source_path=None):
     moved_count = 0
     errors = []
     
-    # Use find_files logic but customized to not recurse too deep if unexpected
     files_to_move = find_files(file_type, source_path)
-    if isinstance(files_to_move, str): # Error message
+    if isinstance(files_to_move, str):
         return files_to_move
         
     for file_path in files_to_move:
-        # Double check each file
         if not is_safe_path(file_path):
             continue
             
@@ -179,7 +200,7 @@ def delete_files(file_type, source_path=None):
     src_dir = resolve_path(source_path)
     
     if not is_safe_path(src_dir):
-        return "Error: unsafe path detected (System Directory)."
+        return "Error: unsafe path detected (Outside User Home)."
         
     deleted_count = 0
     errors = []
@@ -213,19 +234,22 @@ def execute_python_file(path):
         return "Error: Only .py files can be executed."
         
     if not is_safe_path(target_path):
-        return "Error: Unsafe path (System Directory)."
+        return "Error: Unsafe path (Outside User Home)."
         
     if not os.path.exists(target_path):
         return f"Error: File '{target_path}' not found."
 
     try:
-        # Use a timeout to prevent infinite loops blocked the CLI
+        # We assume the user wants to run relative to the script's dir usually
+        # But for this tool, let's keep it simple.
+        cwd = os.path.dirname(target_path)
+        
         result = subprocess.run(
             ["python", target_path], 
             capture_output=True, 
             text=True, 
             timeout=30,
-            cwd=os.path.dirname(target_path) # Run in the script's directory
+            cwd=cwd
         )
         return f"Output:\n{result.stdout}\nErrors:\n{result.stderr}"
     except Exception as e:
